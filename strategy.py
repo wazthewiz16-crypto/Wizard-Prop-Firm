@@ -26,6 +26,7 @@ class WizwaveStrategy:
         self.d2_period = config.get('d2_period', 27)
         self.zone_period = config.get('zone_period', 22)
         self.min_slope = config.get('min_slope', 0.02)
+        self.adx_threshold = config.get('adx_threshold', 25) # New ADX param
 
     def calculate_indicators(self, df):
         """
@@ -35,14 +36,9 @@ class WizwaveStrategy:
         df = df.copy()
         
         # 1. Mango D1 (WMA 29)
-        # Using pandas_ta if available, else manual fallback could be added
-        # assuming pandas_ta is installed as per user context implies tools are available.
-        # Fallback to standard WMA calc if not? 
-        # For robustness, we'll try to use pandas_ta.wma
         try:
             df['Mango_D1'] = ta.wma(df['Close'], length=self.d1_period)
         except Exception:
-            # Simple WMA implementation fallback
             weights = np.arange(1, self.d1_period + 1)
             df['Mango_D1'] = df['Close'].rolling(self.d1_period).apply(
                 lambda x: np.dot(x, weights) / weights.sum(), raw=True
@@ -57,8 +53,22 @@ class WizwaveStrategy:
         df['Zone_Mid'] = (df['Zone_High'] + df['Zone_Low']) / 2
 
         # 4. Slope (Percent change of D1 over 1 bar)
-        # Note: Strategy says "Slope: % change of D1 over 1 bar" -> (D1 - D1[1]) / D1[1] * 100
         df['Slope'] = df['Mango_D1'].pct_change() * 100
+        
+        # 5. ADX (Trend Strength)
+        # Check if enough data for ADX (usually needs 14 bars + period)
+        try:
+            adx_df = ta.adx(df['High'], df['Low'], df['Close'], length=14)
+            # pandas_ta returns ADX_14, DMP_14, DMN_14 usually
+            # We just need ADX value
+            if adx_df is not None and not adx_df.empty:
+                # Find the ADX column (usually first or named ADX_14)
+                adx_col = [c for c in adx_df.columns if c.startswith('ADX')][0]
+                df['ADX'] = adx_df[adx_col]
+            else:
+                df['ADX'] = 0
+        except Exception:
+            df['ADX'] = 0
 
         return df
 
@@ -76,7 +86,8 @@ class WizwaveStrategy:
             (df['Mango_D1'] > df['Mango_D2']) &
             (df['Close'] > df['Mango_D2']) &
             (df['Close'] > df['Zone_Mid']) &
-            (df['Slope'] > self.min_slope)
+            (df['Slope'] > self.min_slope) &
+            (df['ADX'] > self.adx_threshold) # ADX Filter
         )
         
         # Short
@@ -84,7 +95,8 @@ class WizwaveStrategy:
             (df['Mango_D1'] < df['Mango_D2']) &
             (df['Close'] < df['Mango_D2']) &
             (df['Close'] < df['Zone_Mid']) &
-            (df['Slope'] < -self.min_slope)
+            (df['Slope'] < -self.min_slope) &
+            (df['ADX'] > self.adx_threshold) # ADX Filter
         )
         
         # Initialize Signal column

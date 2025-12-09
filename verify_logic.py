@@ -87,8 +87,8 @@ def test_full_pipeline():
     loader = MockLoader()
     
     config = {
-        "strategy": {"d1_period":10, "d2_period":20, "min_slope":0.0, "zone_period":5},
-        "risk": {"volatility_window":10, "pt_multiplier":1, "sl_multiplier":1, "time_limit_bars":5},
+        "strategy": {"d1_period":10, "d2_period":20, "min_slope":0.0, "zone_period":5, "adx_threshold": 10},
+        "risk": {"volatility_window":10, "pt_multiplier":1, "sl_multiplier":1, "time_limit_bars":5, "risk_per_trade": 0.01},
         "ml": {"model_type":"RandomForest", "confidence_threshold":0.5, "test_size":0.5},
         "data": {}
     }
@@ -101,6 +101,18 @@ def test_full_pipeline():
     else:
         print("PASS: Pipeline finished.")
         print("Metrics:", res['metrics'])
+        # Check Equity Curve Structure
+        eq = res['equity_curve']
+        if not eq.empty and 'Equity' in eq.columns and 'Benchmark' in eq.columns:
+             print("PASS: Equity Curve has 'Equity' and 'Benchmark'.")
+        else:
+             print("FAIL: Equity Curve missing columns or empty.")
+             
+        # Check if ADX was calculated
+        if 'ADX' in res['sim_data'].columns:
+             print(f"PASS: ADX Calculated (Mean: {res['sim_data']['ADX'].mean():.2f})")
+        else:
+             print("FAIL: ADX column missing.")
 
 if __name__ == "__main__":
     try:

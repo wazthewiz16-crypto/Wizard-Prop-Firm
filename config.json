@@ -3,18 +3,20 @@
     "d1_period": 29,
     "d2_period": 27,
     "min_slope": 0.02,
-    "zone_period": 22
+    "zone_period": 22,
+    "adx_threshold": 25
   },
   "risk": {
     "volatility_window": 20,
-    "pt_multiplier": 2.0,
-    "sl_multiplier": 2.0,
-    "time_limit_bars": 10
+    "pt_multiplier": 6.0,
+    "sl_multiplier": 1.5,
+    "time_limit_bars": 72,
+    "risk_per_trade": 0.01
   },
   "ml": {
     "model_type": "RandomForest",
     "confidence_threshold": 0.6,
-    "test_size": 0.2
+    "test_size": 0.3
   },
   "data": {
     "default_ticker": "BTC/USDT",

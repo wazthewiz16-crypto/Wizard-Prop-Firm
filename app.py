@@ -20,16 +20,21 @@ source = st.sidebar.selectbox("Source", ["ccxt", "yfinance"], index=0)
 timeframe = st.sidebar.selectbox("Timeframe", ["1h", "4h", "1d", "2d", "4d", "1w"], index=1)
 
 # 2. Strategy Params
+# 2. Strategy Params
 st.sidebar.subheader("Strategy Logic")
-d1_period = st.sidebar.slider("Mango D1 (WMA)", 10, 100, 29)
-d2_period = st.sidebar.slider("Mango D2 (EMA)", 10, 100, 27)
-min_slope = st.sidebar.slider("Min Slope (%)", 0.0, 0.1, 0.02, step=0.01)
+# Fixed params for validation consistency
+d1_period = 29
+d2_period = 27
+st.sidebar.info(f"Mango D1: {d1_period} | D2: {d2_period}")
+min_slope = st.sidebar.slider("Min Slope (%)", 0.0, 0.5, 0.02, step=0.01)
+adx_threshold = st.sidebar.slider("ADX Filter (>)", 0, 50, 25)
 
 # 3. ML & Risk Params
 st.sidebar.subheader("ML & Risk")
 confidence = st.sidebar.slider("ML Confidence Threshold", 0.5, 0.9, 0.60)
-stop_loss = st.sidebar.slider("Stop Loss Multiplier", 0.5, 5.0, 2.0)
-take_profit = st.sidebar.slider("Take Profit Multiplier", 0.5, 10.0, 2.0)
+risk_per_trade = st.sidebar.slider("Risk Per Trade (%)", 0.1, 2.5, 1.0, step=0.1) / 100.0
+stop_loss = st.sidebar.slider("Stop Loss Multiplier", 0.5, 5.0, 1.5)
+take_profit = st.sidebar.slider("Take Profit Multiplier", 0.5, 10.0, 6.0)
 vol_window = st.sidebar.slider("Volatility Window", 5, 50, 20)
 
 if st.sidebar.button("Run Backtest"):
@@ -39,13 +44,15 @@ if st.sidebar.button("Run Backtest"):
             "d1_period": d1_period,
             "d2_period": d2_period,
             "min_slope": min_slope,
-            "zone_period": 22
+            "zone_period": 22,
+            "adx_threshold": adx_threshold
         },
         "risk": {
             "volatility_window": vol_window,
             "pt_multiplier": take_profit,
             "sl_multiplier": stop_loss,
-            "time_limit_bars": 12 
+            "time_limit_bars": 72,
+            "risk_per_trade": risk_per_trade
         },
         "ml": {
             "model_type": "RandomForest",
@@ -105,9 +112,16 @@ if st.sidebar.button("Run Backtest"):
                 st.pyplot(fig)
                 
                 # Equity Curve (Date Axis)
-                st.subheader("Equity Curve")
-                # Ensure it's treated as a Time Series
-                st.line_chart(results["equity_curve"])
+                st.subheader("Equity Curve vs Benchmark")
+                # Ensure it's treated as a Time Series and plot both
+                eq_df = results["equity_curve"]
+                if not eq_df.empty:
+                    # Normalize to start at 0% or same base? 
+                    # Usually better to show absolute $ or % growth.
+                    # Let's show as is (Absolute $)
+                    st.line_chart(eq_df[['Equity', 'Benchmark']])
+                else:
+                    st.write("No equity data to display.")
                 
                 # Trade Log
                 st.subheader("Trade Log")

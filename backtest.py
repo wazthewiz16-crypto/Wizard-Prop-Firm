@@ -17,43 +17,25 @@ class BacktestEngine:
         # 1. Fetch Data
         df = self.loader.fetch_data(ticker, source=source, timeframe=timeframe)
         if df.empty:
-            raise ValueError("No data found.")
+             raise ValueError("No data found.")
             
-        # Filter dates if provided (simple version, loader could handle too)
-        # Assuming df has datetime index
-        
         # 2. Run Strategy (Primary Signals)
         df = self.strategy.calculate_indicators(df)
         df = self.strategy.generate_signals(df)
         
         # 3. Setup ML Data
-        # We need to Label the historical signals to train the model.
-        # Volatility for barriers
         vol = get_volatility(df['Close'], span0=self.config['risk']['volatility_window'])
         
-        # Get Triple Barrier Labels
-        # We only care about labeling when we have a signal.
-        # But get_triple_barrier_labels needs to look forward.
-        
-        # Define events: T1 is expiration.
-        # We need a 't1' series. using 'time_limit_bars'
+        # Define events
         t_limit = self.config['risk']['time_limit_bars']
-        
-        # Create events DataFrame for the labeler
-        # We only label points where Primary_Signal != 0
         signal_indices = df[df['Primary_Signal'] != 0].index
         
         if len(signal_indices) == 0:
             return {"error": "No primary signals generated."}
             
         events = pd.DataFrame(index=signal_indices)
-        events['t1'] = events.index + pd.Timedelta(hours=t_limit) # Approx if 1h, use shift logic for real robustness
-        # For non-pandas-freq aware:
-        # events['t1'] = pd.Series(df.index, index=df.index).shift(-t_limit).loc[signal_indices] 
-        # Using shift on full index is safer
         full_t1 = pd.Series(df.index, index=df.index).shift(-t_limit)
         events['t1'] = full_t1.loc[signal_indices]
-        
         events['trgt'] = vol.loc[signal_indices]
         events['side'] = df.loc[signal_indices, 'Primary_Signal']
         
@@ -66,8 +48,7 @@ class BacktestEngine:
             molecule=events.index
         )
         
-        # Join Labels back to features
-        # Features should be calculated on ALL data, then subset
+        # Features
         features = get_features(df)
         
         # Align features and labels
@@ -79,96 +60,184 @@ class BacktestEngine:
              return {"error": "Not enough data for ML features."}
 
         # 4. Train/Test Split (Chronological)
-        # Split point
-        split_pct = 1 - self.config['ml']['test_size'] # e.g. 0.8
+        split_pct = 1 - self.config['ml']['test_size']
         split_idx = int(len(X) * split_pct)
-        
         X_train, X_test = X.iloc[:split_idx], X.iloc[split_idx:]
-        y_train, y_test = y.iloc[:split_idx], y.iloc[split_idx:]
+        y_train = y.iloc[:split_idx] # y_test not needed for train
         
-        # Train Model
+        # Train
         self.ml_model.train(X_train, y_train)
         
-        # Predict on Test Set
-        # We want the probability of class 1
+        # Predict
         probs = self.ml_model.predict_proba(X_test)
-        # Handle if model only sees 1 class
         if probs.shape[1] > 1:
             prob_side_1 = probs[:, 1]
         else:
-            prob_side_1 = probs[:, 0] # Fallback
+            prob_side_1 = probs[:, 0]
             
-        # 5. Simulate Trading on TEST set
-        # Reconstruct the test dataframe subset
-        # We need the original info (Close, Side) aligned with these predictions
+        # 5. Simulate Trading with MtM
         test_indices = X_test.index
+        # Get subset of DF corresponding to test period (from first test signal to end)
+        if len(test_indices) > 0:
+            start_simulation = test_indices[0]
+            sim_data = df.loc[start_simulation:].copy()
+        else:
+            return {"error": "No test data."}
+
+        # Enrich sim_data with Signals/Probs
+        sim_data['ML_Prob'] = 0.0
+        sim_data.loc[test_indices, 'ML_Prob'] = prob_side_1
         
-        # Simulation loop
+        # We also need to know the 'outcome' or 't1_real' for the trades to know when they close
+        # But we want proper MtM.
+        # So we will replicate the Triple Barrier logic 'live' or use the pre-calced exit time?
+        # Using pre-calced 't1_real' is safer/faster.
+        sim_data['Trade_Exit_Time'] = pd.NaT
+        # Map labels info
+        # common_test = test_indices.intersection(labels.index)
+        # sim_data.loc[common_test, 'Trade_Exit_Time'] = labels.loc[common_test, 't1_real']
+        # Actually 't1_real' in labels is the timestamp of exit.
+        
         # Start Capital
-        capital = 100000
-        equity_curve = [] # Initialize empty to avoid mixed types (float vs dict)
-        
-        # Add initial state if we have the time? 
-        # We'll just track from first bar for simplicity or use the first index.
-        if not test_indices.empty:
-             equity_curve.append({'time': test_indices[0], 'equity': capital})
-        
+        initial_capital = 100000
+        capital = initial_capital
+        equity_curve = [] 
         trades = []
         
-        position = 0
-        entry_price = 0
+        # Track active trade: Only 1 at a time for simplicity in this MVP?
+        # Or list of trades. Let's do list.
+        active_trades = [] # List of dicts: {'entry_price', 'size', 'side', 'exit_time', 'stop_price', 'take_price'}
         
-        # Threshold
+        # Conf Threshold
         conf_thresh = self.config['ml']['confidence_threshold']
         
-        # Combine data for simulation
-        sim_data = df.loc[test_indices].copy()
-        sim_data['ML_Prob'] = prob_side_1
-        # Add the 'ret' from labels (the actual outcome of the Triple Barrier logic)
-        # This simplifies backtest to "what happened" according to barriers
-        # Real backtest would step bar-by-bar, but Triple Barrier outcome is sufficient for 'Signal Quality'
-        sim_data['Actual_Ret'] = labels.loc[test_indices, 'ret']
+        # Benchmark
+        # Buy & Hold from start
+        start_price = sim_data.iloc[0]['Close']
+        bh_size = initial_capital / start_price
         
         for idx, row in sim_data.iterrows():
-            signal = row['Primary_Signal']
-            prob = row['ML_Prob']
-            outcome_ret = row['Actual_Ret']
+            current_price = row['Close']
             
-            # Logic: IF Signal != 0 AND Prob > Threshold -> TAKE TRADE
-            if signal != 0 and prob > conf_thresh:
-                # Trade Executed
-                # PnL = Capital * outcome_ret (assuming 100% equity allocation for simplicity/compounding)
-                # Or Fixed Size? Prompt says "$100k prop firm account"
-                # Let's assume fixed risk per trade or fixed allocation. 
-                # Let's use 10% allocation per trade to be safe/realistic props.
-                alloc = capital * 0.10
-                pnl = alloc * outcome_ret
+            # 1. Manage Active Trades (Mark to Market & Exits)
+            unrealized_pnl = 0
+            remaining_trades = []
+            
+            for trade in active_trades:
+                entry_px = trade['entry_price']
+                side = trade['side'] # 1 or -1
+                size = trade['size']
                 
-                # Estimate Prices for Log
-                entry_px = row['Close'] # Approx
-                # Return r = (Exit - Entry) / Entry  => Exit = Entry * (1 + r)
-                # Note: direction matters. 
-                # Long: r = (Exit - Entry)/Entry -> Exit = Entry(1+r)
-                # Short: r = (Entry - Exit)/Entry -> Exit = Entry(1-r)
+                # Check Exit
+                # We used 'labels' to determine specific exit outcome.
+                # If idx == trade['exit_time'], close it.
+                # Note: 't1_real' from labels is the BAR timestamp where barrier hit.
                 
-                if signal == 1:
-                     exit_px = entry_px * (1 + outcome_ret)
+                if idx >= trade['exit_time']:
+                    # Trade Closes NOW.
+                    # PnL realized.
+                    # Calculate final return based on price 
+                    # (Or use the 'ret' from labels if we want to be exact to barrier logic)
+                    # Let's use current_price for MtM consistency, assuming idx matches t1_real
+                    
+                    if side == 1:
+                        pnl = (current_price - entry_px) * size
+                    else:
+                        pnl = (entry_px - current_price) * size
+                        
+                    capital += pnl
+                    # Log Trade
+                    trades.append({
+                        'Entry Time': trade['entry_time'],
+                        'Exit Time': idx,
+                        'Type': 'Long' if side == 1 else 'Short',
+                        'Entry Price': entry_px,
+                        'Exit Price': current_price,
+                        'PnL': pnl,
+                        'Return': (pnl / (entry_px * size)) if entry_px else 0
+                    })
+                    # Trade removed
                 else:
-                     exit_px = entry_px * (1 - outcome_ret)
-                
-                capital += pnl
-                trades.append({
-                    'Entry Time': idx,
-                    'Type': 'Long' if signal == 1 else 'Short',
-                    'Prob': prob,
-                    'Entry Price': entry_px,
-                    'Exit Price': exit_px,
-                    'Return': outcome_ret,
-                    'PnL': pnl
-                })
+                    # Trade still open, calc unrealized
+                    if side == 1:
+                        upnl = (current_price - entry_px) * size
+                    else:
+                        upnl = (entry_px - current_price) * size
+                    unrealized_pnl += upnl
+                    remaining_trades.append(trade)
             
-            # Record Equity with Time
-            equity_curve.append({'time': idx, 'equity': capital})
+            active_trades = remaining_trades
+            
+            # 2. Check New Entries
+            # Only if index is in test_indices (meaning it has a signal calculation)
+            if idx in test_indices:
+                # We need to look up if this specific signal is valid
+                # Signal is in df['Primary_Signal'] but we need to check the Prob
+                # sim_data has 'ML_Prob' populated for these indices
+                prob = row['ML_Prob']
+                signal = df.loc[idx, 'Primary_Signal']
+                
+                if signal != 0 and prob > conf_thresh:
+                    # Check if we already have a trade? (Pyramiding?)
+                    # Let's limit to 1 active trade for clarity/risk
+                    if len(active_trades) == 0:
+                        # Risk Management: Fixed Fractional Risk
+                        # Risk Amount = Current Equity * Risk Per Trade (e.g. 1%)
+                        risk_pct = self.config['risk'].get('risk_per_trade', 0.01)
+                        risk_amount = capital * risk_pct
+                        
+                        # Calculate Stop Loss Distance
+                        # We used Triple Barrier logic roughly:
+                        # SL Distance = Price * Volatility * Multiplier
+                        if idx in events.index:
+                            # Use volatility at entry time to estimate stop distance
+                            vol_at_entry = vol.loc[idx]
+                            sl_mult = self.config['risk']['sl_multiplier']
+                            sl_dist_pct = vol_at_entry * sl_mult
+                            
+                            # Sanity check: Minimum stop distance?
+                            if sl_dist_pct < 0.002: # Minimum 0.2% stop
+                                sl_dist_pct = 0.002
+                                
+                            entry_price = current_price
+                            stop_price_dist = entry_price * sl_dist_pct
+                            
+                            # Position Size (Units) = Risk Amount / Stop Price Dist
+                            size = risk_amount / stop_price_dist
+                            
+                            # Cap size? Not more than leverage allows. 
+                            # Prop firms typically 1:30 or 1:100.
+                            # Check notional value vs Equity
+                            notional = size * entry_price
+                            if notional > capital * 20: # Max 20x leverage cap safety
+                                size = (capital * 20) / entry_price
+                            
+                            # Find exit time from labels
+                            if idx in labels.index:
+                                exit_time = labels.loc[idx, 't1_real']
+                                # If NaT (no exit found?), default to end of sim
+                                if pd.isna(exit_time):
+                                    exit_time = sim_data.index[-1]
+                                
+                                active_trades.append({
+                                    'entry_time': idx,
+                                    'entry_price': current_price,
+                                    'side': signal,
+                                    'size': size,
+                                    'exit_time': exit_time
+                                })
+            
+            # 3. Record Equity
+            total_equity = capital + unrealized_pnl
+            
+            # Benchmark PnL
+            bh_equity = bh_size * current_price
+            
+            equity_curve.append({
+                'time': idx, 
+                'Equity': total_equity,
+                'Benchmark': bh_equity
+            })
             
         # Metrics
         trades_df = pd.DataFrame(trades)
@@ -177,8 +246,8 @@ class BacktestEngine:
         if not trades_df.empty:
             total_net_profit = capital - 100000
             win_rate = len(trades_df[trades_df['PnL'] > 0]) / len(trades_df)
-            max_dd = (equity_df['equity'].cummax() - equity_df['equity']).max()
-            profit_factor = trades_df[trades_df['PnL'] > 0]['PnL'].sum() / abs(trades_df[trades_df['PnL'] < 0]['PnL'].sum())
+            max_dd = (equity_df['Equity'].cummax() - equity_df['Equity']).max()
+            profit_factor = trades_df[trades_df['PnL'] > 0]['PnL'].sum() / abs(trades_df[trades_df['PnL'] < 0]['PnL'].sum()) if len(trades_df[trades_df['PnL'] < 0]) > 0 else float('inf')
         else:
             total_net_profit = 0
             win_rate = 0
@@ -193,7 +262,7 @@ class BacktestEngine:
                 "Profit Factor": profit_factor,
                 "Total Trades": len(trades_df)
             },
-            "equity_curve": equity_df, # Returned as DataFrame with Date Index
+            "equity_curve": equity_df,
             "trades": trades_df,
             "sim_data": sim_data
         }
