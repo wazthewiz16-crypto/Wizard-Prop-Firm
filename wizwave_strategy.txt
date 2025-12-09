@@ -1,0 +1,106 @@
+//@version=5
+strategy("Wizard Wave: Filtered Momentum [Quant Architect]", overlay=true, initial_capital=10000, default_qty_type=strategy.percent_of_equity, default_qty_value=100, currency=currency.USD)
+
+// -----------------------------------------------------------------------------
+// 1. INPUTS
+// -----------------------------------------------------------------------------
+grp_mango   = "Mango Lines"
+len_d1      = input.int(29, "Mango D1 Length (Fast)", group=grp_mango)
+src_d1      = input.source(close, "Mango D1 Source", group=grp_mango)
+len_d2      = input.int(27, "Mango D2 Length (Slow)", group=grp_mango)
+src_d2      = input.source(close, "Mango D2 Source", group=grp_mango)
+
+grp_filter  = "Signal Filters"
+// NEW: Slope Threshold. Higher number = Fewer trades.
+min_slope   = input.float(0.02, "Min Slope Strength (%)", minval=0.0, step=0.01, tooltip="Filters out flat trends. Increase to reduce trades.", group=grp_filter)
+len_zone    = input.int(22, "Zone Length", group=grp_filter)
+src_zone_hi = input.source(high, "Zone Upper Source", group=grp_filter)
+src_zone_lo = input.source(low, "Zone Lower Source", group=grp_filter)
+
+grp_risk    = "Risk Management"
+use_stop    = input.bool(true, "Use Fixed Stop/TP?", group=grp_risk)
+sl_perc     = input.float(3.0, "Stop Loss %", group=grp_risk) / 100
+tp_perc     = input.float(5.0, "Take Profit %", group=grp_risk) / 100
+
+grp_time    = "Backtest Window"
+start_date  = input.time(timestamp("2023-01-01 00:00"), "Start Date", group=grp_time)
+end_date    = input.time(timestamp("2099-12-31 00:00"), "End Date", group=grp_time)
+
+// -----------------------------------------------------------------------------
+// 2. CALCULATIONS
+// -----------------------------------------------------------------------------
+// Mango Trend Indicators
+mango_d1 = ta.wma(src_d1, len_d1) // Fast
+mango_d2 = ta.ema(src_d2, len_d2) // Slow
+
+// Context Zones
+zone_upper = ta.ema(src_zone_hi, len_zone)
+zone_lower = ta.ema(src_zone_lo, len_zone)
+band_midpoint = math.avg(zone_upper, zone_lower)
+
+// --- NEW CALCULATION: SLOPE ---
+// We measure the percent change of the Fast Line (D1) over 1 bar
+d1_slope_pct = (mango_d1 - mango_d1[1]) / mango_d1[1] * 100
+
+// -----------------------------------------------------------------------------
+// 3. LOGIC & FILTERS
+// -----------------------------------------------------------------------------
+
+// Trend Direction
+is_bull_trend = mango_d1 > mango_d2
+is_bear_trend = mango_d1 < mango_d2
+
+// Slope Filter Logic
+// For Longs: Slope must be POSITIVE and greater than threshold
+valid_long_slope = d1_slope_pct > min_slope
+// For Shorts: Slope must be NEGATIVE and steeper (more negative) than -threshold
+valid_short_slope = d1_slope_pct < -min_slope
+
+// Entry Conditions
+// 1. Bullish Trend
+// 2. Price > Slow Line (Momentum or Pullback)
+// 3. Price > Midpoint (Structure)
+// 4. Slope > Threshold (Strength Filter)
+long_signal = is_bull_trend and close > mango_d2 and close > band_midpoint and valid_long_slope
+
+short_signal = is_bear_trend and close < mango_d2 and close < band_midpoint and valid_short_slope
+
+// Time Filter
+in_window = time >= start_date and time <= end_date
+
+// -----------------------------------------------------------------------------
+// 4. EXECUTION
+// -----------------------------------------------------------------------------
+
+if in_window
+    if strategy.position_size == 0
+        if long_signal
+            strategy.entry("Long", strategy.long, comment="L | SlopeOk")
+        
+        if short_signal
+            strategy.entry("Short", strategy.short, comment="S | SlopeOk")
+
+// -----------------------------------------------------------------------------
+// 5. EXITS
+// -----------------------------------------------------------------------------
+if use_stop
+    strategy.exit("Exit L", "Long", stop=strategy.position_avg_price * (1 - sl_perc), limit=strategy.position_avg_price * (1 + tp_perc))
+    strategy.exit("Exit S", "Short", stop=strategy.position_avg_price * (1 + sl_perc), limit=strategy.position_avg_price * (1 - tp_perc))
+
+// Trend Reversal Exit (Safety Net)
+if strategy.position_size > 0 and close < mango_d2
+    strategy.close("Long", comment="Trend Broken")
+if strategy.position_size < 0 and close > mango_d2
+    strategy.close("Short", comment="Trend Broken")
+
+// -----------------------------------------------------------------------------
+// 6. VISUALIZATION
+// -----------------------------------------------------------------------------
+p_d1 = plot(mango_d1, "Mango D1", color=color.new(color.orange, 0), linewidth=2)
+p_d2 = plot(mango_d2, "Mango D2", color=color.new(color.aqua, 0), linewidth=2)
+fill(p_d1, p_d2, color=is_bull_trend ? color.new(color.green, 80) : color.new(color.red, 80), title="Trend Cloud")
+
+// Color the background when Slope is too weak (No Trade Zone)
+bgcolor(not valid_long_slope and not valid_short_slope ? color.new(color.gray, 90) : na, title="Flat Slope Filter")
+
+plot(band_midpoint, "Midpoint", color=color.new(color.white, 70))
